@@ -24,6 +24,33 @@ import {
 } from "lucide-react";
 import { UserAccount, PayPalSubscription, SubscriptionPlan, RenewalNotification } from "../types";
 
+// Helper to perform safe fetch and assert JSON response content type to handle transient server startup states
+async function safeJsonFetch(url: string, options?: RequestInit) {
+  const response = await fetch(url, options);
+  
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type");
+    if (contentType && contentType.includes("application/json")) {
+      try {
+        const errJson = await response.json();
+        throw new Error(errJson.error || errJson.message || `HTTP error status ${response.status}`);
+      } catch (e: any) {
+        if (e.message && !e.message.includes("HTTP error")) {
+          throw e;
+        }
+      }
+    }
+    throw new Error(`HTTP error status ${response.status}`);
+  }
+
+  const contentType = response.headers.get("content-type");
+  if (!contentType || !contentType.includes("application/json")) {
+    throw new TypeError("Response format was not JSON (the server might be restarting or compiling).");
+  }
+
+  return response.json();
+}
+
 export default function SubscriptionManager() {
   const [users, setUsers] = useState<UserAccount[]>([]);
   const [currentUserId, setCurrentUserId] = useState<string>("");
@@ -43,11 +70,7 @@ export default function SubscriptionManager() {
   // Fetch the backend state
   const fetchState = async () => {
     try {
-      const response = await fetch("/api/paypal/state");
-      if (!response.ok) {
-        throw new Error(`Failed to load subscription database: status ${response.status}`);
-      }
-      const data = await response.json();
+      const data = await safeJsonFetch("/api/paypal/state");
       setUsers(data.users || []);
       setCurrentUserId(data.currentUserId || "");
       setPlans(data.plans || []);
@@ -55,7 +78,18 @@ export default function SubscriptionManager() {
       setNotifications(data.notifications || []);
       setError(null);
     } catch (err: any) {
-      if (err.name === "TypeError" && err.message.includes("Failed to fetch")) {
+      const isTransient = 
+        (err instanceof TypeError) ||
+        (err instanceof SyntaxError) ||
+        (err.name === "TypeError") ||
+        (err.message && (
+          err.message.includes("Failed to fetch") || 
+          err.message.includes("was not JSON") || 
+          err.message.includes("is not valid JSON") ||
+          err.message.includes("Unexpected token")
+        ));
+
+      if (isTransient) {
         console.warn("Subscription state fetch failed (server starting/restarting):", err.message);
       } else {
         console.error("Error fetching subscription state:", err);
@@ -77,12 +111,11 @@ export default function SubscriptionManager() {
   const handleUserSelect = async (userId: string) => {
     try {
       setLoading(true);
-      const res = await fetch("/api/paypal/user/select", {
+      await safeJsonFetch("/api/paypal/user/select", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ userId })
       });
-      if (!res.ok) throw new Error("Could not propagate user change on the backend.");
       await fetchState();
     } catch (err: any) {
       setError(err.message);
@@ -95,16 +128,11 @@ export default function SubscriptionManager() {
   const handleSubscribeInitiate = async (planId: string) => {
     try {
       setLoading(true);
-      const res = await fetch("/api/paypal/subscription/create", {
+      const result = await safeJsonFetch("/api/paypal/subscription/create", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ planId, billingCycle: "monthly" })
       });
-      if (!res.ok) {
-        const errJson = await res.json();
-        throw new Error(errJson.error || "Failed to create subscription agreement.");
-      }
-      const result = await res.json();
       
       // Update local copy immediately and open the checkout dialog
       setPendingSubscriptionId(result.subscription.id);
@@ -127,12 +155,11 @@ export default function SubscriptionManager() {
       // Emulate brief loading delay representing the secure banking verification tunnel handshake
       await new Promise(resolve => setTimeout(resolve, 1500));
 
-      const res = await fetch("/api/paypal/subscription/approve", {
+      await safeJsonFetch("/api/paypal/subscription/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ subscriptionId: pendingSubscriptionId })
       });
-      if (!res.ok) throw new Error("Handshake failed to capture buyer tokens on server.");
       
       setCheckoutStep("done");
       await fetchState();
@@ -155,12 +182,11 @@ export default function SubscriptionManager() {
     }
     try {
       setLoading(true);
-      const res = await fetch("/api/paypal/subscription/cancel", {
+      await safeJsonFetch("/api/paypal/subscription/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ subscriptionId: subId })
       });
-      if (!res.ok) throw new Error("Cancellation route failed.");
       await fetchState();
     } catch (err: any) {
       setError(err.message);
@@ -173,12 +199,11 @@ export default function SubscriptionManager() {
   const handleSimulateRenewal = async (subId: string, simulateFailure: boolean) => {
     try {
       setIsSimulatingRenewal(true);
-      const res = await fetch("/api/paypal/subscription/simulate-renewal", {
+      await safeJsonFetch("/api/paypal/subscription/simulate-renewal", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ subscriptionId: subId, simulateFailure })
       });
-      if (!res.ok) throw new Error("Simulator renewal trigger crashed.");
       await fetchState();
     } catch (err: any) {
       setError(err.message);
